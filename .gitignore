@@ -1,0 +1,8 @@
+# Base de datos local: contiene datos reales del negocio, no debe subirse
+kompilador_store.db
+
+# Restos de compilacion
+__pycache__/
+build/
+dist/
+*.spec

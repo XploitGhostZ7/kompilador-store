@@ -363,10 +363,33 @@ def poblar_si_vacio(db: BaseDatos):
 # =====================================================================
 # INTERFAZ GRÁFICA
 # =====================================================================
-COLOR_BG = "#EFEBE3"
-COLOR_SURFACE = "#FFFDF8"
-COLOR_INDIGO = "#2E3A59"
-COLOR_RUST = "#B1442E"
+def activar_nitidez_dpi():
+    """Declara el programa como DPI-aware en Windows.
+
+    Sin esto, en una pantalla con escalado (125 %, 150 %) Windows dibuja
+    la ventana a 96 DPI y despues ESTIRA el mapa de bits: el texto sale
+    borroso en vez de redibujarse nitido. Debe llamarse ANTES de crear
+    la ventana raiz.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # Windows 8.1+
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()       # Windows 7
+    except Exception:
+        pass  # si falla, el programa igual abre (solo se vera borroso)
+
+
+# --- Paleta azul Kompilador ---
+COLOR_BG = "#E9EFF8"          # fondo general (azul muy claro)
+COLOR_SURFACE = "#FFFFFF"     # superficies: tablas y campos de texto
+COLOR_INDIGO = "#12325C"      # azul profundo: encabezados, pestana activa, boton principal
+COLOR_AZUL = "#2E6FD0"        # azul vivo: seleccion, hover y foco
+COLOR_AZUL_TENUE = "#CBDCF3"  # azul suave: pestanas inactivas y botones secundarios
+COLOR_TEXTO = "#16202E"       # texto principal
 FONT_TITLE = ("Georgia", 16, "bold")
 FONT_LABEL = ("Segoe UI", 10)
 
@@ -375,21 +398,88 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Kompilador Store — Panel de gestión")
-        self.geometry("1080x680")
+
+        # Escala segun el DPI real de la pantalla (125 % -> 1.25).
+        # Las fuentes van en puntos, asi que basta con ajustar el
+        # "scaling" de Tk; las medidas en pixeles se multiplican a mano.
+        dpi = self.winfo_fpixels("1i")
+        self.escala = dpi / 96.0
+        self.tk.call("tk", "scaling", dpi / 72.0)
+
+        ancho = min(int(1080 * self.escala), int(self.winfo_screenwidth() * 0.95))
+        alto = min(int(680 * self.escala), int(self.winfo_screenheight() * 0.88))
+        self.geometry(f"{ancho}x{alto}")
+        self.minsize(900, 560)
         self.configure(bg=COLOR_BG)
         self.db = BaseDatos()
         poblar_si_vacio(self.db)
         self.venta_items = []  # líneas de la venta en construcción
 
+        px = self.px
         style = ttk.Style(self)
         try:
             style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("TNotebook.Tab", padding=(14, 8), font=FONT_LABEL)
-        style.configure("Treeview", rowheight=24, font=FONT_LABEL)
-        style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
+        # Base: todo hereda el fondo azul claro y el texto oscuro
+        style.configure(".", background=COLOR_BG, foreground=COLOR_TEXTO,
+                        font=FONT_LABEL, bordercolor=COLOR_AZUL_TENUE,
+                        lightcolor=COLOR_BG, darkcolor=COLOR_BG)
+        style.configure("TFrame", background=COLOR_BG)
+        style.configure("TLabel", background=COLOR_BG, foreground=COLOR_TEXTO)
+        style.configure("TLabelframe", background=COLOR_BG, bordercolor=COLOR_AZUL_TENUE)
+        style.configure("TLabelframe.Label", background=COLOR_BG, foreground=COLOR_INDIGO)
+
+        # Pestanas: inactivas en azul suave, la activa en azul profundo
+        style.configure("TNotebook", background=COLOR_BG, borderwidth=0)
+        style.configure("TNotebook.Tab", padding=(px(14), px(8)), font=FONT_LABEL,
+                        background=COLOR_AZUL_TENUE, foreground=COLOR_INDIGO,
+                        borderwidth=0)
+        style.map("TNotebook.Tab",
+                  background=[("selected", COLOR_INDIGO), ("active", COLOR_AZUL)],
+                  foreground=[("selected", "white"), ("active", "white")])
+
+        # Tablas: fondo blanco, encabezado azul profundo, seleccion azul viva
+        style.configure("Treeview", rowheight=px(26), font=FONT_LABEL,
+                        background=COLOR_SURFACE, fieldbackground=COLOR_SURFACE,
+                        foreground=COLOR_TEXTO, borderwidth=0)
+        style.map("Treeview",
+                  background=[("selected", COLOR_AZUL)],
+                  foreground=[("selected", "white")])
+        style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"),
+                        background=COLOR_INDIGO, foreground="white", relief="flat")
+        style.map("Treeview.Heading", background=[("active", COLOR_AZUL)])
+
+        # Botones
+        style.configure("TButton", background=COLOR_AZUL_TENUE, foreground=COLOR_INDIGO,
+                        padding=(px(10), px(5)), borderwidth=0, focusthickness=0)
+        style.map("TButton",
+                  background=[("pressed", COLOR_INDIGO), ("active", COLOR_AZUL)],
+                  foreground=[("pressed", "white"), ("active", "white")])
         style.configure("Accent.TButton", background=COLOR_INDIGO, foreground="white")
+        style.map("Accent.TButton",
+                  background=[("pressed", COLOR_INDIGO), ("active", COLOR_AZUL)],
+                  foreground=[("active", "white")])
+
+        # Campos de texto y desplegables
+        style.configure("TEntry", fieldbackground=COLOR_SURFACE, foreground=COLOR_TEXTO,
+                        bordercolor=COLOR_AZUL_TENUE, insertcolor=COLOR_TEXTO)
+        style.map("TEntry", bordercolor=[("focus", COLOR_AZUL)])
+        style.configure("TCombobox", fieldbackground=COLOR_SURFACE, background=COLOR_AZUL_TENUE,
+                        foreground=COLOR_TEXTO, arrowcolor=COLOR_INDIGO,
+                        bordercolor=COLOR_AZUL_TENUE)
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", COLOR_SURFACE)],
+                  bordercolor=[("focus", COLOR_AZUL)])
+        self.option_add("*TCombobox*Listbox.background", COLOR_SURFACE)
+        self.option_add("*TCombobox*Listbox.foreground", COLOR_TEXTO)
+        self.option_add("*TCombobox*Listbox.selectBackground", COLOR_AZUL)
+        self.option_add("*TCombobox*Listbox.selectForeground", "white")
+
+        # Barras de desplazamiento
+        style.configure("TScrollbar", background=COLOR_AZUL_TENUE, troughcolor=COLOR_BG,
+                        bordercolor=COLOR_BG, arrowcolor=COLOR_INDIGO, borderwidth=0)
+        style.map("TScrollbar", background=[("active", COLOR_AZUL)])
 
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True, padx=10, pady=10)
@@ -435,11 +525,11 @@ class App(tk.Tk):
 
     # =================== RESUMEN ===================
     def _armar_resumen(self, parent):
-        self.lbl_stats = tk.Label(parent, text="", font=FONT_TITLE, bg=COLOR_BG, justify="left", anchor="w")
+        self.lbl_stats = tk.Label(parent, text="", font=FONT_TITLE, bg=COLOR_BG, fg=COLOR_INDIGO, justify="left", anchor="w")
         self.lbl_stats.pack(fill="x", padx=16, pady=16)
         ttk.Button(parent, text="Actualizar", command=self.refrescar_todo).pack(anchor="w", padx=16)
 
-        tk.Label(parent, text="Stock por debajo del mínimo", font=("Segoe UI", 11, "bold"), bg=COLOR_BG)\
+        tk.Label(parent, text="Stock por debajo del mínimo", font=("Segoe UI", 11, "bold"), bg=COLOR_BG, fg=COLOR_INDIGO)\
             .pack(anchor="w", padx=16, pady=(18, 4))
         self.tree_resumen_stock = self._crear_tabla(parent, ["Local", "Producto", "Disponible", "Mínimo"])
 
@@ -575,7 +665,7 @@ class App(tk.Tk):
         self.e_local_codigo = self._campo(form, "Código:", width=10)
         self.cb_local_tipo = ttk.Combobox(form, values=["tienda", "bodega", "ecommerce"], width=10, state="readonly")
         self.cb_local_tipo.set("tienda")
-        tk.Label(form, text="Tipo:", bg=COLOR_BG).pack(side="left", padx=(8, 2))
+        tk.Label(form, text="Tipo:", bg=COLOR_BG, fg=COLOR_INDIGO).pack(side="left", padx=(8, 2))
         self.cb_local_tipo.pack(side="left", padx=4)
         self.e_local_ciudad = self._campo(form, "Ciudad:", width=14)
         ttk.Button(form, text="Agregar", command=self._agregar_local).pack(side="left", padx=6)
@@ -711,13 +801,13 @@ class App(tk.Tk):
 
         self.tree_lineas = self._crear_tabla(parent, ["Producto", "Cantidad", "Precio", "Subtotal"], alto=4)
         fila_total = ttk.Frame(parent); fila_total.pack(fill="x", padx=10, pady=4)
-        self.lbl_total_venta = tk.Label(fila_total, text="Total: $0", font=("Segoe UI", 11, "bold"), bg=COLOR_BG)
+        self.lbl_total_venta = tk.Label(fila_total, text="Total: $0", font=("Segoe UI", 11, "bold"), bg=COLOR_BG, fg=COLOR_INDIGO)
         self.lbl_total_venta.pack(side="left")
         ttk.Button(fila_total, text="Quitar línea seleccionada", command=self._quitar_linea_venta)\
             .pack(side="left", padx=10)
         ttk.Button(fila_total, text="Registrar venta", command=self._registrar_venta).pack(side="right")
 
-        tk.Label(parent, text="Historial de ventas", font=("Segoe UI", 11, "bold"), bg=COLOR_BG)\
+        tk.Label(parent, text="Historial de ventas", font=("Segoe UI", 11, "bold"), bg=COLOR_BG, fg=COLOR_INDIGO)\
             .pack(anchor="w", padx=10, pady=(14, 4))
         self.tree_ventas = self._crear_tabla(parent, ["ID", "Orden", "Fecha", "Local", "Cliente", "Total"])
         ttk.Button(parent, text="Eliminar venta seleccionada (repone stock)", command=self._eliminar_venta)\
@@ -799,11 +889,11 @@ class App(tk.Tk):
     # =================== REPORTES ===================
     def _armar_reportes(self, parent):
         ttk.Button(parent, text="Actualizar reportes", command=self.refrescar_todo).pack(anchor="w", padx=10, pady=10)
-        tk.Label(parent, text="Productos más vendidos", font=("Segoe UI", 11, "bold"), bg=COLOR_BG)\
+        tk.Label(parent, text="Productos más vendidos", font=("Segoe UI", 11, "bold"), bg=COLOR_BG, fg=COLOR_INDIGO)\
             .pack(anchor="w", padx=10)
         self.tree_top_productos = self._crear_tabla(parent, ["Producto", "Unidades vendidas"], alto=6)
 
-        tk.Label(parent, text="Ventas por local", font=("Segoe UI", 11, "bold"), bg=COLOR_BG)\
+        tk.Label(parent, text="Ventas por local", font=("Segoe UI", 11, "bold"), bg=COLOR_BG, fg=COLOR_INDIGO)\
             .pack(anchor="w", padx=10, pady=(14, 4))
         self.tree_ventas_local = self._crear_tabla(parent, ["Local", "# Ventas", "Total vendido"], alto=6)
 
@@ -819,13 +909,13 @@ class App(tk.Tk):
     # WIDGETS AUXILIARES
     # =====================================================================
     def _campo(self, parent, etiqueta, width=16):
-        tk.Label(parent, text=etiqueta, bg=COLOR_BG).pack(side="left", padx=(8, 2))
+        tk.Label(parent, text=etiqueta, bg=COLOR_BG, fg=COLOR_INDIGO).pack(side="left", padx=(8, 2))
         entry = ttk.Entry(parent, width=width)
         entry.pack(side="left", padx=2)
         return entry
 
     def _combo(self, parent, etiqueta, opcional=False):
-        tk.Label(parent, text=etiqueta, bg=COLOR_BG).pack(side="left", padx=(8, 2))
+        tk.Label(parent, text=etiqueta, bg=COLOR_BG, fg=COLOR_INDIGO).pack(side="left", padx=(8, 2))
         combo = ttk.Combobox(parent, width=24, state="readonly")
         combo.pack(side="left", padx=2)
         combo._opcional = opcional
@@ -848,13 +938,17 @@ class App(tk.Tk):
             return None
         return combo._ids[idx]
 
+    def px(self, n):
+        """Convierte una medida pensada a 100 % al DPI real de la pantalla."""
+        return int(round(n * self.escala))
+
     def _crear_tabla(self, parent, columnas, alto=8):
         cont = ttk.Frame(parent)
         cont.pack(fill="both", expand=True, padx=10, pady=6)
         tree = ttk.Treeview(cont, columns=columnas, show="headings", height=alto)
         for c in columnas:
             tree.heading(c, text=c)
-            tree.column(c, width=120, anchor="w")
+            tree.column(c, width=self.px(120), anchor="w")
         scroll = ttk.Scrollbar(cont, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=scroll.set)
         tree.pack(side="left", fill="both", expand=True)
@@ -874,5 +968,6 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
+    activar_nitidez_dpi()   # debe ir antes de crear la ventana
     app = App()
     app.mainloop()
