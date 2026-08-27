@@ -18,6 +18,8 @@ Cómo ejecutar:
 =====================================================================
 """
 
+import hashlib
+import hmac
 import sqlite3
 import sys
 import os
@@ -101,7 +103,32 @@ CREATE TABLE IF NOT EXISTS detalle_venta (
     precio_unitario NUMERIC NOT NULL,
     subtotal        NUMERIC NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS usuarios (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    usuario       TEXT UNIQUE NOT NULL COLLATE NOCASE,
+    clave_hash    BLOB NOT NULL,
+    sal           BLOB NOT NULL,
+    iteraciones   INTEGER NOT NULL,
+    creado        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ultimo_acceso TIMESTAMP
+);
 """
+
+
+# =====================================================================
+# CLAVES
+# =====================================================================
+# La clave NUNCA se guarda. Se guarda el resultado de pasarla por
+# PBKDF2-HMAC-SHA256 con una sal distinta por usuario, lo que hace que
+# probar claves a lo bruto sea lento y que dos usuarios con la misma
+# clave tengan hashes distintos. Todo con biblioteca estandar.
+ITERACIONES = 240_000
+CLAVE_MINIMA = 8
+
+
+def derivar_clave(clave, sal, iteraciones):
+    return hashlib.pbkdf2_hmac("sha256", clave.encode("utf-8"), sal, iteraciones)
 
 
 # =====================================================================
@@ -113,6 +140,58 @@ class BaseDatos:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA_SQL)
+        self.conn.commit()
+
+    # ---------- usuarios y acceso ----------
+    def hay_usuarios(self):
+        return self.conn.execute("SELECT 1 FROM usuarios LIMIT 1").fetchone() is not None
+
+    def crear_usuario(self, usuario, clave):
+        usuario = usuario.strip()
+        if len(usuario) < 3:
+            raise ValueError("El usuario debe tener al menos 3 caracteres.")
+        if len(clave) < CLAVE_MINIMA:
+            raise ValueError(f"La clave debe tener al menos {CLAVE_MINIMA} caracteres.")
+        sal = os.urandom(16)
+        try:
+            self.conn.execute(
+                "INSERT INTO usuarios (usuario, clave_hash, sal, iteraciones) "
+                "VALUES (?, ?, ?, ?)",
+                (usuario, derivar_clave(clave, sal, ITERACIONES), sal, ITERACIONES),
+            )
+        except sqlite3.IntegrityError:
+            raise ValueError("Ese usuario ya existe.")
+        self.conn.commit()
+
+    def verificar_usuario(self, usuario, clave):
+        """Devuelve True si la clave coincide. Comparacion en tiempo constante."""
+        fila = self.conn.execute(
+            "SELECT clave_hash, sal, iteraciones FROM usuarios WHERE usuario = ?",
+            (usuario.strip(),),
+        ).fetchone()
+        if fila is None:
+            # Deriva igual contra una sal falsa: asi un usuario inexistente
+            # tarda lo mismo que uno real y no se pueden enumerar por tiempo.
+            derivar_clave(clave, bytes(16), ITERACIONES)
+            return False
+        calculado = derivar_clave(clave, fila["sal"], fila["iteraciones"])
+        return hmac.compare_digest(calculado, fila["clave_hash"])
+
+    def cambiar_clave(self, usuario, clave_nueva):
+        if len(clave_nueva) < CLAVE_MINIMA:
+            raise ValueError(f"La clave debe tener al menos {CLAVE_MINIMA} caracteres.")
+        sal = os.urandom(16)
+        self.conn.execute(
+            "UPDATE usuarios SET clave_hash = ?, sal = ?, iteraciones = ? WHERE usuario = ?",
+            (derivar_clave(clave_nueva, sal, ITERACIONES), sal, ITERACIONES, usuario.strip()),
+        )
+        self.conn.commit()
+
+    def marcar_acceso(self, usuario):
+        self.conn.execute(
+            "UPDATE usuarios SET ultimo_acceso = CURRENT_TIMESTAMP WHERE usuario = ?",
+            (usuario.strip(),),
+        )
         self.conn.commit()
 
     # ---------- categorías ----------
@@ -390,14 +469,236 @@ COLOR_INDIGO = "#12325C"      # azul profundo: encabezados, pestana activa, boto
 COLOR_AZUL = "#2E6FD0"        # azul vivo: seleccion, hover y foco
 COLOR_AZUL_TENUE = "#CBDCF3"  # azul suave: pestanas inactivas y botones secundarios
 COLOR_TEXTO = "#16202E"       # texto principal
+COLOR_ERROR = "#B3261E"       # avisos de error
 FONT_TITLE = ("Georgia", 16, "bold")
 FONT_LABEL = ("Segoe UI", 10)
+
+
+class DialogoModal(tk.Toplevel):
+    """Ventana pequeña que bloquea el resto del programa hasta cerrarse."""
+
+    def __init__(self, padre, titulo):
+        super().__init__(padre)
+        self.padre = padre
+        self.resultado = None
+        self.title(titulo)
+        self.configure(bg=COLOR_BG)
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._cancelar)
+        self.bind("<Escape>", lambda e: self._cancelar())
+
+    def _cancelar(self):
+        self.resultado = None
+        self.destroy()
+
+    def mostrar(self):
+        """Centra la ventana, bloquea el resto y espera. Devuelve el resultado."""
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() - self.winfo_reqwidth()) // 2
+        y = (self.winfo_screenheight() - self.winfo_reqheight()) // 3
+        self.geometry(f"+{x}+{y}")
+        self.grab_set()
+        self.lift()
+        self.focus_force()
+        self.wait_window(self)
+        return self.resultado
+
+
+class VentanaLogin(DialogoModal):
+    """Pide usuario y clave. El resultado es el nombre de usuario si entra."""
+
+    MAX_INTENTOS = 5
+
+    def __init__(self, padre, db):
+        super().__init__(padre, "Kompilador Store — Iniciar sesión")
+        self.db = db
+        self.intentos = 0
+        px = padre.px
+
+        marco = ttk.Frame(self, padding=px(24))
+        marco.pack(fill="both", expand=True)
+
+        ttk.Label(marco, text="Kompilador Store", font=FONT_TITLE,
+                  foreground=COLOR_INDIGO).grid(row=0, column=0, columnspan=2)
+        sub = ttk.Label(marco, text="Ingresa tus datos para continuar")
+        sub.grid(row=1, column=0, columnspan=2, pady=(px(2), px(18)))
+
+        ttk.Label(marco, text="Usuario:").grid(row=2, column=0, sticky="e",
+                                               padx=(0, px(8)), pady=px(5))
+        self.e_usuario = ttk.Entry(marco, width=26)
+        self.e_usuario.grid(row=2, column=1, pady=px(5))
+
+        ttk.Label(marco, text="Clave:").grid(row=3, column=0, sticky="e",
+                                             padx=(0, px(8)), pady=px(5))
+        self.e_clave = ttk.Entry(marco, width=26, show="•")
+        self.e_clave.grid(row=3, column=1, pady=px(5))
+
+        self.lbl_aviso = ttk.Label(marco, text="", foreground=COLOR_ERROR,
+                                   wraplength=px(280))
+        self.lbl_aviso.grid(row=4, column=0, columnspan=2, pady=(px(10), 0))
+
+        botones = ttk.Frame(marco)
+        botones.grid(row=5, column=0, columnspan=2, pady=(px(18), 0))
+        ttk.Button(botones, text="Entrar", style="Accent.TButton",
+                   command=self._entrar).pack(side="left", padx=px(4))
+        ttk.Button(botones, text="Salir",
+                   command=self._cancelar).pack(side="left", padx=px(4))
+
+        self.bind("<Return>", lambda e: self._entrar())
+        self.e_usuario.focus_set()
+
+    def _entrar(self):
+        usuario = self.e_usuario.get().strip()
+        clave = self.e_clave.get()
+        if not usuario or not clave:
+            self.lbl_aviso.config(text="Escribe el usuario y la clave.")
+            return
+        if self.db.verificar_usuario(usuario, clave):
+            self.resultado = usuario
+            self.destroy()
+            return
+
+        # Mensaje unico a proposito: no se dice si fallo el usuario o la
+        # clave, para no confirmarle a nadie que cierto usuario existe.
+        self.intentos += 1
+        restantes = self.MAX_INTENTOS - self.intentos
+        if restantes <= 0:
+            messagebox.showerror(
+                "Acceso bloqueado",
+                "Demasiados intentos fallidos. El programa se va a cerrar.",
+                parent=self)
+            self._cancelar()
+            return
+        self.lbl_aviso.config(
+            text=f"Usuario o clave incorrectos. Te quedan {restantes} intentos.")
+        self.e_clave.delete(0, "end")
+        self.e_clave.focus_set()
+
+
+class VentanaCrearUsuario(DialogoModal):
+    """Primer arranque: da de alta al administrador. Resultado: (usuario, clave)."""
+
+    def __init__(self, padre):
+        super().__init__(padre, "Kompilador Store — Primer ingreso")
+        px = padre.px
+
+        marco = ttk.Frame(self, padding=px(24))
+        marco.pack(fill="both", expand=True)
+
+        ttk.Label(marco, text="Crea tu usuario", font=FONT_TITLE,
+                  foreground=COLOR_INDIGO).grid(row=0, column=0, columnspan=2)
+        aviso = ttk.Label(
+            marco, wraplength=px(330), justify="left",
+            text="Es la primera vez que abres el programa. Define el usuario y la "
+                 "clave con los que vas a entrar de ahora en adelante. Anótala: no "
+                 "hay forma de recuperarla.")
+        aviso.grid(row=1, column=0, columnspan=2, pady=(px(6), px(18)))
+
+        self.campos = []
+        for i, texto in enumerate(["Usuario:", "Clave:", "Repetir clave:"]):
+            ttk.Label(marco, text=texto).grid(row=2 + i, column=0, sticky="e",
+                                              padx=(0, px(8)), pady=px(5))
+            e = ttk.Entry(marco, width=26, show=None if i == 0 else "•")
+            e.grid(row=2 + i, column=1, pady=px(5))
+            self.campos.append(e)
+
+        ttk.Label(marco,
+                  text=f"La clave debe tener al menos {CLAVE_MINIMA} caracteres.",
+                  foreground=COLOR_INDIGO).grid(row=5, column=0, columnspan=2,
+                                                pady=(px(8), 0))
+        self.lbl_aviso = ttk.Label(marco, text="", foreground=COLOR_ERROR,
+                                   wraplength=px(330))
+        self.lbl_aviso.grid(row=6, column=0, columnspan=2, pady=(px(6), 0))
+
+        botones = ttk.Frame(marco)
+        botones.grid(row=7, column=0, columnspan=2, pady=(px(18), 0))
+        ttk.Button(botones, text="Crear y entrar", style="Accent.TButton",
+                   command=self._crear).pack(side="left", padx=px(4))
+        ttk.Button(botones, text="Salir",
+                   command=self._cancelar).pack(side="left", padx=px(4))
+
+        self.bind("<Return>", lambda e: self._crear())
+        self.campos[0].focus_set()
+
+    def _crear(self):
+        usuario = self.campos[0].get().strip()
+        clave, repetida = self.campos[1].get(), self.campos[2].get()
+        if len(usuario) < 3:
+            self.lbl_aviso.config(text="El usuario debe tener al menos 3 caracteres.")
+            return
+        if len(clave) < CLAVE_MINIMA:
+            self.lbl_aviso.config(
+                text=f"La clave debe tener al menos {CLAVE_MINIMA} caracteres.")
+            return
+        if clave != repetida:
+            self.lbl_aviso.config(text="Las dos claves no coinciden.")
+            self.campos[2].delete(0, "end")
+            self.campos[2].focus_set()
+            return
+        self.resultado = (usuario, clave)
+        self.destroy()
+
+
+class VentanaCambiarClave(DialogoModal):
+    """Cambio de clave del usuario en sesión. Resultado: (actual, nueva)."""
+
+    def __init__(self, padre):
+        super().__init__(padre, "Cambiar clave")
+        px = padre.px
+
+        marco = ttk.Frame(self, padding=px(24))
+        marco.pack(fill="both", expand=True)
+
+        ttk.Label(marco, text="Cambiar clave", font=FONT_TITLE,
+                  foreground=COLOR_INDIGO).grid(row=0, column=0, columnspan=2,
+                                                pady=(0, px(16)))
+
+        self.campos = []
+        for i, texto in enumerate(["Clave actual:", "Clave nueva:",
+                                   "Repetir la nueva:"]):
+            ttk.Label(marco, text=texto).grid(row=1 + i, column=0, sticky="e",
+                                              padx=(0, px(8)), pady=px(5))
+            e = ttk.Entry(marco, width=26, show="•")
+            e.grid(row=1 + i, column=1, pady=px(5))
+            self.campos.append(e)
+
+        self.lbl_aviso = ttk.Label(marco, text="", foreground=COLOR_ERROR,
+                                   wraplength=px(300))
+        self.lbl_aviso.grid(row=4, column=0, columnspan=2, pady=(px(10), 0))
+
+        botones = ttk.Frame(marco)
+        botones.grid(row=5, column=0, columnspan=2, pady=(px(18), 0))
+        ttk.Button(botones, text="Guardar", style="Accent.TButton",
+                   command=self._guardar).pack(side="left", padx=px(4))
+        ttk.Button(botones, text="Cancelar",
+                   command=self._cancelar).pack(side="left", padx=px(4))
+
+        self.bind("<Return>", lambda e: self._guardar())
+        self.campos[0].focus_set()
+
+    def _guardar(self):
+        actual, nueva, repetida = (c.get() for c in self.campos)
+        if len(nueva) < CLAVE_MINIMA:
+            self.lbl_aviso.config(
+                text=f"La clave nueva debe tener al menos {CLAVE_MINIMA} caracteres.")
+            return
+        if nueva != repetida:
+            self.lbl_aviso.config(text="Las dos claves nuevas no coinciden.")
+            return
+        if nueva == actual:
+            self.lbl_aviso.config(
+                text="La clave nueva tiene que ser distinta de la actual.")
+            return
+        self.resultado = (actual, nueva)
+        self.destroy()
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Kompilador Store — Panel de gestión")
+        self.withdraw()          # nada se muestra hasta iniciar sesión
+        self.usuario = None      # usuario en sesión
 
         # Escala segun el DPI real de la pantalla (125 % -> 1.25).
         # Las fuentes van en puntos, asi que basta con ajustar el
@@ -481,8 +782,18 @@ class App(tk.Tk):
                         bordercolor=COLOR_BG, arrowcolor=COLOR_INDIGO, borderwidth=0)
         style.map("TScrollbar", background=[("active", COLOR_AZUL)])
 
+        barra = ttk.Frame(self)
+        barra.pack(fill="x", padx=px(12), pady=(px(8), 0))
+        self.lbl_sesion = ttk.Label(barra, text="", font=("Segoe UI", 10, "bold"),
+                                    foreground=COLOR_INDIGO)
+        self.lbl_sesion.pack(side="left")
+        ttk.Button(barra, text="Cerrar sesión",
+                   command=self._cerrar_sesion).pack(side="right", padx=(px(6), 0))
+        ttk.Button(barra, text="Cambiar clave",
+                   command=self._cambiar_clave).pack(side="right")
+
         notebook = ttk.Notebook(self)
-        notebook.pack(fill="both", expand=True, padx=10, pady=10)
+        notebook.pack(fill="both", expand=True, padx=px(10), pady=(px(6), px(10)))
 
         self.tab_resumen = ttk.Frame(notebook)
         self.tab_catalogo = ttk.Frame(notebook)
@@ -509,6 +820,64 @@ class App(tk.Tk):
         self._armar_reportes(self.tab_reportes)
 
         self.refrescar_todo()
+
+    # =================== SESIÓN ===================
+    def iniciar_sesion(self):
+        """Pide credenciales y solo entonces muestra el panel.
+
+        En el primer arranque todavía no hay usuarios, así que pide crear
+        el administrador en vez de traer una clave por defecto escrita en
+        el código (que quedaría publicada en el repositorio).
+        Devuelve True si se autenticó.
+        """
+        if not self.db.hay_usuarios():
+            datos = VentanaCrearUsuario(self).mostrar()
+            if not datos:
+                return False
+            usuario, clave = datos
+            try:
+                self.db.crear_usuario(usuario, clave)
+            except ValueError as e:
+                messagebox.showerror("No se pudo crear el usuario", str(e))
+                return False
+        else:
+            usuario = VentanaLogin(self, self.db).mostrar()
+            if not usuario:
+                return False
+
+        self.usuario = usuario
+        self.db.marcar_acceso(usuario)
+        self.lbl_sesion.config(text=f"Sesión: {usuario}")
+        self.refrescar_todo()
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+        return True
+
+    def _cerrar_sesion(self):
+        if not messagebox.askyesno("Cerrar sesión", "¿Cerrar la sesión actual?",
+                                   parent=self):
+            return
+        self.usuario = None
+        self.withdraw()
+        if not self.iniciar_sesion():
+            self.destroy()
+
+    def _cambiar_clave(self):
+        datos = VentanaCambiarClave(self).mostrar()
+        if not datos:
+            return
+        actual, nueva = datos
+        if not self.db.verificar_usuario(self.usuario, actual):
+            messagebox.showerror("Clave incorrecta",
+                                 "La clave actual no coincide.", parent=self)
+            return
+        try:
+            self.db.cambiar_clave(self.usuario, nueva)
+        except ValueError as e:
+            messagebox.showerror("No se pudo cambiar", str(e), parent=self)
+            return
+        messagebox.showinfo("Listo", "Tu clave quedó actualizada.", parent=self)
 
     # -----------------------------------------------------------------
     def refrescar_todo(self):
@@ -970,4 +1339,7 @@ class App(tk.Tk):
 if __name__ == "__main__":
     activar_nitidez_dpi()   # debe ir antes de crear la ventana
     app = App()
-    app.mainloop()
+    if app.iniciar_sesion():
+        app.mainloop()
+    else:
+        app.destroy()
