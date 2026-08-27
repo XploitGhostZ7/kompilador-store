@@ -1,0 +1,30 @@
+name: Compilar EXE Windows
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar PyInstaller
+        run: pip install pyinstaller
+
+      - name: Construir el ejecutable
+        run: pyinstaller --onefile --windowed --name KompiladorStore kompilador_store_gui.py
+
+      - name: Publicar el .exe como artefacto descargable
+        uses: actions/upload-artifact@v4
+        with:
+          name: KompiladorStore-windows
+          path: dist/KompiladorStore.exe
